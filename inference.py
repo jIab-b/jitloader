@@ -15,7 +15,7 @@ from transformers import T5Tokenizer, CLIPTokenizer
 
 from .model_loader import load_pipeline
 
-def run_inference(prompt: str, output_path: str = "jitloader/output.png", quant_config: str = None):
+def run_inference(prompt: str, output_path: str = "jitloader/output.png", quant_config: str = None, cpu_pool_gb: int = 2, gpu_pool_gb: int = 4):
     """
     Runs the full JIT inference pipeline with sequential text encoders.
     """
@@ -23,7 +23,10 @@ def run_inference(prompt: str, output_path: str = "jitloader/output.png", quant_
     print(f"Using device: {device}")
 
     # 1. Load all model schedulers
-    schedulers = load_pipeline(device, quant_config=quant_config)
+    # 1. Load all model schedulers and allocator
+    cpu_pool_size = cpu_pool_gb * 1024 * 1024 * 1024
+    gpu_pool_size = gpu_pool_gb * 1024 * 1024 * 1024
+    schedulers = load_pipeline(device, quant_config=quant_config, cpu_pool_size=cpu_pool_size, gpu_pool_size=gpu_pool_size)
     t5_scheduler = schedulers["t5"]
     clip_scheduler = schedulers["clip"]
     flux_scheduler = schedulers["flux"]

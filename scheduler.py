@@ -5,16 +5,18 @@ from torch import nn
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 
-from .safetensor_loader import SafetensorLoader
+from .safetensor_loader import SafetensorLoader, SAFETENSORS_DTYPE_MAP
+from .mem_allocator import MemoryAllocator
 
 class BaseScheduler:
     """
     Base class for all schedulers, providing asynchronous pre-fetching.
     """
-    def __init__(self, path: str, model_blueprint: nn.Module, device: str = "cuda", model_config: dict = None, quant_config: str = None, prefetch_depth: int = 2):
+    def __init__(self, path: str, model_blueprint: nn.Module, allocator: MemoryAllocator, device: str = "cuda", model_config: dict = None, quant_config: str = None, prefetch_depth: int = 2):
         self.device = device
         self.loader = SafetensorLoader(path, model_config=model_config, quant_config=quant_config)
         self.blueprint = model_blueprint.to("meta")
+        self.allocator = allocator
         self.prefetch_depth = prefetch_depth
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.prefetch_queue = Queue(maxsize=prefetch_depth)
@@ -23,29 +25,41 @@ class BaseScheduler:
     def _prepare_execution_plan(self, plan: list):
         self.execution_plan = plan
         for layer_name in self.execution_plan[:self.prefetch_depth]:
-            future = self.executor.submit(self._load_layer_state_dict, layer_name)
+            future = self.executor.submit(self._load_layer_to_pool, layer_name)
             self.prefetch_queue.put((layer_name, future))
 
-    def _load_layer_state_dict(self, layer_name: str):
-        state_dict = {}
+    def _load_layer_to_pool(self, layer_name: str):
+        """
+        Loads all tensors for a layer into pre-allocated memory pools.
+        Returns a dictionary of handles (allocated tensors) and their names.
+        """
+        self.allocator.reset('cpu')
+        handles = {}
         submodule = self.blueprint.get_submodule(layer_name)
-        for pname, _ in submodule.named_parameters(recurse=False):
-            full_name = f"{layer_name}.{pname}"
-            tensor = self.loader.load_tensor(full_name).to(self.device)
-            if self.loader.quant_config:
-                tensor = self.loader.F.quantize_4bit(
-                    tensor,
-                    quant_type=self.loader.quant_config,
-                    blocksize=64
-                )[0]
-            state_dict[pname] = tensor
-        for bname, _ in submodule.named_buffers(recurse=False):
-            full_name = f"{layer_name}.{bname}"
+
+        for name, param in submodule.named_parameters(recurse=False):
+            full_name = f"{layer_name}.{name}"
+            info = self.loader.get_tensor_info(full_name)
+            dtype = SAFETENSORS_DTYPE_MAP[info['dtype']]
+            size = torch.tensor([], dtype=dtype).element_size() * torch.prod(torch.tensor(info['shape']))
+
+            cpu_buffer = self.allocator.allocate(size, 'cpu').view(dtype).reshape(param.shape)
+            self.loader.load_tensor_into(full_name, cpu_buffer)
+            handles[name] = cpu_buffer
+
+        for name, buffer in submodule.named_buffers(recurse=False):
+            full_name = f"{layer_name}.{name}"
             try:
-                state_dict[bname] = self.loader.load_tensor(full_name).to(self.device)
+                info = self.loader.get_tensor_info(full_name)
+                dtype = SAFETENSORS_DTYPE_MAP[info['dtype']]
+                size = torch.tensor([], dtype=dtype).element_size() * torch.prod(torch.tensor(info['shape']))
+                
+                cpu_buffer = self.allocator.allocate(size, 'cpu').view(dtype).reshape(buffer.shape)
+                self.loader.load_tensor_into(full_name, cpu_buffer)
+                handles[name] = cpu_buffer
             except KeyError:
                 pass
-        return state_dict
+        return handles
 
     def execute_layer(self, layer_name: str, *args, **kwargs):
         """
@@ -61,21 +75,26 @@ class BaseScheduler:
         next_to_prefetch_index = current_index + self.prefetch_depth
         if next_to_prefetch_index < len(self.execution_plan):
             next_layer_to_prefetch = self.execution_plan[next_to_prefetch_index]
-            new_future = self.executor.submit(self._load_layer_state_dict, next_layer_to_prefetch)
+            new_future = self.executor.submit(self._load_layer_to_pool, next_layer_to_prefetch)
             self.prefetch_queue.put((next_layer_to_prefetch, new_future))
 
         # Get the state dict from the completed future. Tensors are already on the correct device.
-        state_dict = future.result()
+        cpu_handles = future.result()
+        self.allocator.reset('gpu')
+        state_dict = {}
+
+        # Transfer to GPU and build state_dict
+        for name, cpu_tensor in cpu_handles.items():
+            gpu_tensor = self.allocator.allocate(cpu_tensor.nbytes, 'cuda').view(cpu_tensor.dtype).reshape(cpu_tensor.shape)
+            gpu_tensor.copy_(cpu_tensor)
+            state_dict[name] = gpu_tensor
+
         submodule = self.blueprint.get_submodule(layer_name).to_empty(device=self.device)
-        
         submodule.load_state_dict(state_dict, strict=False)
 
         with torch.no_grad():
             output = submodule(*args, **kwargs)
 
-        del state_dict
-        submodule.to("cpu")
-        torch.cuda.empty_cache()
         return output
 
 class FluxScheduler(BaseScheduler):

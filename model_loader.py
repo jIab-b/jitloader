@@ -16,6 +16,7 @@ from comfy.ldm.flux.model import Flux
 
 from .safetensor_metadata import extract_safetensor_metadata
 from .scheduler import FluxScheduler, VAEScheduler, T5Scheduler, CLIPScheduler
+from .mem_allocator import MemoryAllocator
 
 
 def _load_vae_model_config():
@@ -91,7 +92,7 @@ def _load_t5_weight_map(path: str):
         return json.load(f)
 
 
-def load_pipeline(device: str = "cuda", quant_config: str = None):
+def load_pipeline(device: str = "cuda", quant_config: str = None, cpu_pool_size: int = 2*1024*1024*1024, gpu_pool_size: int = 4*1024*1024*1024):
     """
     Loads metadata-only safetensor files and returns initialized schedulers.
     Returns:
@@ -120,13 +121,16 @@ def load_pipeline(device: str = "cuda", quant_config: str = None):
     flux_config = _load_flux_model_config()
     flux_blueprint = Flux(**flux_config, operations=ops.disable_weight_init).to("meta")
 
+    # Initialize memory allocator
+    allocator = MemoryAllocator(cpu_pool_size, gpu_pool_size, device)
+
     # Initialize schedulers
-    clip_scheduler = CLIPScheduler(clip_path, clip_blueprint, device=device, quant_config=quant_config)
+    clip_scheduler = CLIPScheduler(clip_path, clip_blueprint, allocator, device=device, quant_config=quant_config)
     t5_model_dir = "jitloader/t5"
     t5_weight_map = _load_t5_weight_map("jitloader/t5/model.safetensors.index.json")
-    t5_scheduler = T5Scheduler(t5_model_dir, t5_blueprint, device=device, model_config=t5_weight_map, quant_config=quant_config)
-    vae_scheduler = VAEScheduler(vae_path, vae_blueprint, device=device, quant_config=quant_config)
-    flux_scheduler = FluxScheduler(flux_path, flux_blueprint, device=device, quant_config=quant_config)
+    t5_scheduler = T5Scheduler(t5_model_dir, t5_blueprint, allocator, device=device, model_config=t5_weight_map, quant_config=quant_config)
+    vae_scheduler = VAEScheduler(vae_path, vae_blueprint, allocator, device=device, quant_config=quant_config)
+    flux_scheduler = FluxScheduler(flux_path, flux_blueprint, allocator, device=device, quant_config=quant_config)
 
     return {
         "clip": clip_scheduler,

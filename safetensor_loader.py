@@ -77,28 +77,32 @@ class SafetensorLoader:
         for file_handle in self.file_handles.values():
             file_handle.close()
 
-    def load_tensor(self, name: str) -> torch.Tensor:
+    def get_tensor_info(self, name: str) -> dict:
         """
-        Materialise a tensor from disk to a raw CPU tensor.
-        Device placement and quantization are handled by the scheduler.
+        Returns the metadata for a single tensor.
         """
         if self.weight_map:
             if name not in self.weight_map:
                 raise KeyError(f"Tensor '{name}' not found in the weight map.")
             filename = self.weight_map[name]
             header = self.headers[filename]
-            mmap_obj = self.mmaps[filename]
-            data_start_offset = self.data_start_offsets[filename]
         else:
             filename = '__single__'
             header = self.headers[filename]
-            mmap_obj = self.mmaps[filename]
-            data_start_offset = self.data_start_offsets[filename]
 
         if name not in header:
             raise KeyError(f"Tensor '{name}' not found in header of '{filename}'.")
         
-        info = header[name]
+        return header[name]
+
+    def load_tensor_into(self, name: str, buffer: torch.Tensor):
+        """
+        Loads a tensor from disk directly into a pre-allocated buffer.
+        """
+        info = self.get_tensor_info(name)
+        filename = self.weight_map.get(name, '__single__')
+        mmap_obj = self.mmaps[filename]
+        data_start_offset = self.data_start_offsets[filename]
         dtype = SAFETENSORS_DTYPE_MAP.get(info['dtype'])
         if dtype is None:
             raise TypeError(f"Unsupported dtype '{info['dtype']}' for tensor '{name}'")
@@ -109,15 +113,16 @@ class SafetensorLoader:
         
         data_offset = data_start_offset + offsets[0]
         data = mmap_obj[data_offset : data_offset + data_len]
-
-        if info['dtype'] == 'BF16':
-            np_array = np.frombuffer(data, dtype=np.uint16).reshape(shape)
-            tensor = torch.from_numpy(np_array).view(torch.bfloat16)
-        else:
-            numpy_dtype = NUMPY_DTYPE_MAP.get(info['dtype'])
-            if numpy_dtype is None:
-                raise TypeError(f"Unsupported numpy dtype '{info['dtype']}' for tensor '{name}'")
-            np_array = np.frombuffer(data, dtype=numpy_dtype).reshape(shape)
-            tensor = torch.from_numpy(np_array)
         
-        return tensor
+        if info['dtype'] == 'BF16':
+            # NumPy doesn't have a bfloat16, so we read as uint16 and view as bfloat16 in torch
+            np_buffer = np.frombuffer(data, dtype=np.uint16).reshape(shape)
+            tensor_view = torch.from_numpy(np_buffer).view(torch.bfloat16)
+        else:
+            # Create a numpy array view of the buffer without copying
+            np_buffer = np.frombuffer(data, dtype=NUMPY_DTYPE_MAP[info['dtype']]).reshape(shape)
+            # Create a torch tensor from the numpy array without copying
+            tensor_view = torch.from_numpy(np_buffer)
+
+        # Copy the data into the provided buffer
+        buffer.copy_(tensor_view)
