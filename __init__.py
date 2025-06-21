@@ -11,7 +11,7 @@ Both classes are skeletal. Refer to in-file TODO markers in
 `jitloader/scheduler.py` for guidance on completing the implementation.
 """
 
-from .scheduler import SafetensorLoader, InferenceScheduler
+from .scheduler import SafetensorLoader, FluxScheduler
 
 __all__ = [
     "SafetensorLoader",

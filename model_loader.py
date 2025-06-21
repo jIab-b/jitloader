@@ -6,6 +6,7 @@ Loads only metadata from .safetensors using safetensor_metadata,
 creates dummy blueprints, and initializes InferenceScheduler for each model.
 TODO: Replace DummyModel with actual model blueprints (CLIP, T5, VAE, Flux).
 """
+import json
 from transformers import CLIPTextConfig, CLIPTextModel, T5Config, T5EncoderModel
 import comfy.ops as ops
 
@@ -14,7 +15,7 @@ from comfy.ldm.models.autoencoder import AutoencoderKL
 from comfy.ldm.flux.model import Flux
 
 from .safetensor_metadata import extract_safetensor_metadata
-from .scheduler import InferenceScheduler
+from .scheduler import FluxScheduler, VAEScheduler, T5Scheduler, CLIPScheduler
 
 
 def _load_vae_model_config():
@@ -52,6 +53,14 @@ def _load_model_config(path: str):
     return metadata.get("__metadata__", {})
 
 
+def _load_t5_weight_map(path: str):
+    """
+    Loads the T5 weight map from its specific JSON index file.
+    """
+    with open(path, 'r') as f:
+        return json.load(f)
+
+
 def load_pipeline(device: str = "cuda"):
     """
     Loads metadata-only safetensor files and returns initialized schedulers.
@@ -79,10 +88,12 @@ def load_pipeline(device: str = "cuda"):
     flux_blueprint = Flux(**flux_config, operations=ops.disable_weight_init).to("meta")
 
     # Initialize schedulers
-    clip_scheduler = InferenceScheduler(clip_path, clip_blueprint, device=device)
-    t5_scheduler = InferenceScheduler(t5_path, t5_blueprint, device=device)
-    vae_scheduler = InferenceScheduler(vae_path, vae_blueprint, device=device)
-    flux_scheduler = InferenceScheduler(flux_path, flux_blueprint, device=device)
+    clip_scheduler = CLIPScheduler(clip_path, clip_blueprint, device=device)
+    t5_model_dir = "jitloader/t5"
+    t5_weight_map = _load_t5_weight_map("jitloader/t5/model.safetensors.index.json")
+    t5_scheduler = T5Scheduler(t5_model_dir, t5_blueprint, device=device, model_config=t5_weight_map)
+    vae_scheduler = VAEScheduler(vae_path, vae_blueprint, device=device)
+    flux_scheduler = FluxScheduler(flux_path, flux_blueprint, device=device)
 
     return {
         "clip": clip_scheduler,
