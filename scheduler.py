@@ -2,38 +2,69 @@
 
 import torch
 from torch import nn
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
 
 from .safetensor_loader import SafetensorLoader
 
 class BaseScheduler:
     """
-    Base class for all schedulers, providing common functionality.
+    Base class for all schedulers, providing asynchronous pre-fetching.
     """
-    def __init__(self, path: str, model_blueprint: nn.Module, device: str = "cuda", model_config: dict = None):
+    def __init__(self, path: str, model_blueprint: nn.Module, device: str = "cuda", model_config: dict = None, quant_config: str = None, prefetch_depth: int = 2):
         self.device = device
-        self.loader = SafetensorLoader(path, model_config=model_config)
+        self.loader = SafetensorLoader(path, model_config=model_config, quant_config=quant_config)
         self.blueprint = model_blueprint.to("meta")
+        self.prefetch_depth = prefetch_depth
+        self.executor = ThreadPoolExecutor(max_workers=1)
+        self.prefetch_queue = Queue(maxsize=prefetch_depth)
+        self.execution_plan = []
 
-    def execute_layer(self, layer_name: str, *args, **kwargs):
-        """
-        Loads and executes a single layer of the model.
-        """
-        submodule = self.blueprint.get_submodule(layer_name)
-        if submodule is None:
-            raise ValueError(f"{layer_name} not found in blueprint")
+    def _prepare_execution_plan(self, plan: list):
+        self.execution_plan = plan
+        for layer_name in self.execution_plan[:self.prefetch_depth]:
+            future = self.executor.submit(self._load_layer_state_dict, layer_name)
+            self.prefetch_queue.put((layer_name, future))
 
+    def _load_layer_state_dict(self, layer_name: str):
         state_dict = {}
+        submodule = self.blueprint.get_submodule(layer_name)
         for pname, _ in submodule.named_parameters(recurse=False):
             full_name = f"{layer_name}.{pname}"
-            state_dict[pname] = self.loader.load_tensor(full_name, device=self.device)
-
+            state_dict[pname] = self.loader.load_tensor(full_name, device='cpu')
         for bname, _ in submodule.named_buffers(recurse=False):
             full_name = f"{layer_name}.{bname}"
             try:
-                state_dict[bname] = self.loader.load_tensor(full_name, device=self.device)
+                state_dict[bname] = self.loader.load_tensor(full_name, device='cpu')
             except KeyError:
                 pass
+        return state_dict
 
+    def execute_layer(self, layer_name: str, *args, **kwargs):
+        """
+        Executes a single layer, using the pre-fetch buffer.
+        """
+        # Get the next layer from the queue
+        next_layer_name, future = self.prefetch_queue.get()
+        if next_layer_name != layer_name:
+            raise RuntimeError(f"Execution plan mismatch: expected {layer_name}, got {next_layer_name}")
+
+        # Load the next layer in the plan into the queue
+        current_index = self.execution_plan.index(layer_name)
+        next_to_prefetch_index = current_index + self.prefetch_depth
+        if next_to_prefetch_index < len(self.execution_plan):
+            next_layer_to_prefetch = self.execution_plan[next_to_prefetch_index]
+            new_future = self.executor.submit(self._load_layer_state_dict, next_layer_to_prefetch)
+            self.prefetch_queue.put((next_layer_to_prefetch, new_future))
+
+        # Get the state dict from the completed future
+        state_dict = future.get()
+        submodule = self.blueprint.get_submodule(layer_name)
+        
+        # Move tensors to GPU and execute
+        for key, tensor in state_dict.items():
+            state_dict[key] = tensor.to(self.device)
+        
         submodule = submodule.to(self.device)
         submodule.load_state_dict(state_dict, strict=False)
 
@@ -50,6 +81,15 @@ class FluxScheduler(BaseScheduler):
     Scheduler for the main FLUX transformer model.
     """
     def run_inference(self, x, timestep, context, y=None, guidance=None, **kwargs):
+        plan = ['img_in', 'time_in']
+        if self.blueprint.params.guidance_embed and guidance is not None:
+            plan.append('guidance_in')
+        plan.extend(['vector_in', 'txt_in', 'pe_embedder'])
+        plan.extend([f'double_blocks.{i}' for i in range(len(self.blueprint.double_blocks))])
+        plan.extend([f'single_blocks.{i}' for i in range(len(self.blueprint.single_blocks))])
+        plan.append('final_layer')
+        self._prepare_execution_plan(plan)
+        
         from comfy.ldm.flux.layers import timestep_embedding
         from einops import rearrange, repeat
         import comfy.ldm.common_dit
@@ -94,10 +134,19 @@ class VAEScheduler(BaseScheduler):
     Scheduler for the VAE model.
     """
     def run_decoder_inference(self, latents):
-        # This is a simplified decoder implementation
+        plan = ['conv_in']
+        plan.extend([f'mid.block_{i+1}' for i in range(self.blueprint.mid.num_res_blocks)])
+        plan.extend([f'up.{i}.block.{j}' for i in range(len(self.blueprint.up)) for j in range(self.blueprint.up[i].num_res_blocks)])
+        plan.extend(['norm_out', 'conv_out'])
+        self._prepare_execution_plan(plan)
+
         x = self.execute_layer('conv_in', latents)
-        x = self.execute_layer('mid.block_1', x)
-        # ... more layers would be executed here ...
+        for i in range(self.blueprint.mid.num_res_blocks):
+            x = self.execute_layer(f'mid.block_{i+1}', x)
+        for i in range(len(self.blueprint.up)):
+            for j in range(self.blueprint.up[i].num_res_blocks):
+                x = self.execute_layer(f'up.{i}.block.{j}', x)
+        x = self.execute_layer('norm_out', x)
         x = self.execute_layer('conv_out', x)
         return x
 
@@ -106,6 +155,9 @@ class T5Scheduler(BaseScheduler):
     Scheduler for the T5 text encoder.
     """
     def run_encoder_inference(self, input_ids):
+        plan = ['shared'] + [f'block.{i}' for i in range(len(self.blueprint.block))] + ['final_layer_norm']
+        self._prepare_execution_plan(plan)
+
         hidden_states = self.execute_layer('shared', input_ids)
         for i in range(len(self.blueprint.block)):
             hidden_states = self.execute_layer(f'block.{i}', hidden_states)[0]
@@ -117,6 +169,9 @@ class CLIPScheduler(BaseScheduler):
     Scheduler for the CLIP text encoder.
     """
     def run_encoder_inference(self, input_ids):
+        plan = ['text_model.embeddings'] + [f'text_model.encoder.layers.{i}' for i in range(len(self.blueprint.text_model.encoder.layers))] + ['text_model.final_layer_norm']
+        self._prepare_execution_plan(plan)
+
         hidden_states = self.execute_layer('text_model.embeddings', input_ids)
         for i in range(len(self.blueprint.text_model.encoder.layers)):
             hidden_states = self.execute_layer(f'text_model.encoder.layers.{i}', hidden_states)[0]

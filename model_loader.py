@@ -61,7 +61,7 @@ def _load_t5_weight_map(path: str):
         return json.load(f)
 
 
-def load_pipeline(device: str = "cuda"):
+def load_pipeline(device: str = "cuda", quant_config: str = None):
     """
     Loads metadata-only safetensor files and returns initialized schedulers.
     Returns:
@@ -88,12 +88,12 @@ def load_pipeline(device: str = "cuda"):
     flux_blueprint = Flux(**flux_config, operations=ops.disable_weight_init).to("meta")
 
     # Initialize schedulers
-    clip_scheduler = CLIPScheduler(clip_path, clip_blueprint, device=device)
+    clip_scheduler = CLIPScheduler(clip_path, clip_blueprint, device=device, quant_config=quant_config)
     t5_model_dir = "jitloader/t5"
     t5_weight_map = _load_t5_weight_map("jitloader/t5/model.safetensors.index.json")
-    t5_scheduler = T5Scheduler(t5_model_dir, t5_blueprint, device=device, model_config=t5_weight_map)
-    vae_scheduler = VAEScheduler(vae_path, vae_blueprint, device=device)
-    flux_scheduler = FluxScheduler(flux_path, flux_blueprint, device=device)
+    t5_scheduler = T5Scheduler(t5_model_dir, t5_blueprint, device=device, model_config=t5_weight_map, quant_config=quant_config)
+    vae_scheduler = VAEScheduler(vae_path, vae_blueprint, device=device, quant_config=quant_config)
+    flux_scheduler = FluxScheduler(flux_path, flux_blueprint, device=device, quant_config=quant_config)
 
     return {
         "clip": clip_scheduler,

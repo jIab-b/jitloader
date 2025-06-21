@@ -24,10 +24,17 @@ class SafetensorLoader:
     On-demand safetensor loader using memory-mapping for zero-copy reads.
     Can handle single-file or multi-file (sharded) models.
     """
-    def __init__(self, path: str, model_config: dict = None):
+    def __init__(self, path: str, model_config: dict = None, quant_config: str = None):
         self.path = path
         self.model_config = model_config or {}
         self.weight_map = self.model_config.get('weight_map')
+        self.quant_config = quant_config
+        if self.quant_config:
+            try:
+                import bitsandbytes.functional as F
+                self.F = F
+            except ImportError:
+                raise ImportError("bitsandbytes is required for quantization. Please install it.")
 
         self.file_handles = {}
         self.mmaps = {}
@@ -111,5 +118,8 @@ class SafetensorLoader:
                 raise TypeError(f"Unsupported numpy dtype '{info['dtype']}' for tensor '{name}'")
             np_array = np.frombuffer(data, dtype=numpy_dtype).reshape(shape)
             tensor = torch.from_numpy(np_array)
+        
+        if self.quant_config == "nf4":
+            return self.F.quantize_4bit(tensor, blocksize=64, compute_dtype=torch.bfloat16)[0].to(device)
         
         return tensor.to(device)
