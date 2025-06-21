@@ -111,6 +111,7 @@ def load_pipeline(device: str = "cuda", quant_config: str = None):
 
     t5_config_dict = _load_t5_config(t5_path)
     t5_config = T5Config.from_dict(t5_config_dict)
+    t5_config.use_cache = False
     t5_blueprint = T5EncoderModel(t5_config).to("meta")
 
     vae_config = _load_vae_model_config()

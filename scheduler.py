@@ -184,7 +184,7 @@ class T5Scheduler(BaseScheduler):
 
         hidden_states = self.execute_layer('shared', input_ids)
         for i in range(len(self.blueprint.encoder.block)):
-            hidden_states = self.execute_layer(f'encoder.block.{i}', hidden_states)[0]
+            hidden_states = self.execute_layer(f'encoder.block.{i}', hidden_states, use_cache=False)[0]
         hidden_states = self.execute_layer('encoder.final_layer_norm', hidden_states)
         return hidden_states
 
