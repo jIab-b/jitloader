@@ -58,7 +58,7 @@ class BaseScheduler:
             self.prefetch_queue.put((next_layer_to_prefetch, new_future))
 
         # Get the state dict from the completed future
-        state_dict = future.get()
+        state_dict = future.result()
         submodule = self.blueprint.get_submodule(layer_name)
         
         # Move tensors to GPU and execute
@@ -134,34 +134,56 @@ class VAEScheduler(BaseScheduler):
     Scheduler for the VAE model.
     """
     def run_decoder_inference(self, latents):
-        plan = ['conv_in']
-        plan.extend([f'mid.block_{i+1}' for i in range(self.blueprint.mid.num_res_blocks)])
-        plan.extend([f'up.{i}.block.{j}' for i in range(len(self.blueprint.up)) for j in range(self.blueprint.up[i].num_res_blocks)])
-        plan.extend(['norm_out', 'conv_out'])
+        latents = latents / self.blueprint.config.get("scaling_factor", 0.18215)
+        
+        plan = ['post_quant_conv']
+        plan.append('decoder.conv_in')
+        plan.append('decoder.mid.block_1')
+        plan.append('decoder.mid.attn_1')
+        plan.append('decoder.mid.block_2')
+
+        for i in reversed(range(self.blueprint.decoder.num_resolutions)):
+            for j in range(self.blueprint.decoder.num_res_blocks + 1):
+                plan.append(f'decoder.up.{i}.block.{j}')
+            if self.blueprint.decoder.up[i].attn:
+                plan.append(f'decoder.up.{i}.attn.0')
+            if i != 0:
+                plan.append(f'decoder.up.{i}.upsample')
+
+        plan.extend(['decoder.norm_out', 'decoder.conv_out'])
         self._prepare_execution_plan(plan)
 
-        x = self.execute_layer('conv_in', latents)
-        for i in range(self.blueprint.mid.num_res_blocks):
-            x = self.execute_layer(f'mid.block_{i+1}', x)
-        for i in range(len(self.blueprint.up)):
-            for j in range(self.blueprint.up[i].num_res_blocks):
-                x = self.execute_layer(f'up.{i}.block.{j}', x)
-        x = self.execute_layer('norm_out', x)
-        x = self.execute_layer('conv_out', x)
-        return x
+        h = self.execute_layer('post_quant_conv', latents)
+        h = self.execute_layer('decoder.conv_in', h)
+        h = self.execute_layer('decoder.mid.block_1', h)
+        h = self.execute_layer('decoder.mid.attn_1', h)
+        h = self.execute_layer('decoder.mid.block_2', h)
+
+        for i in reversed(range(self.blueprint.decoder.num_resolutions)):
+            for j in range(self.blueprint.decoder.num_res_blocks + 1):
+                h = self.execute_layer(f'decoder.up.{i}.block.{j}', h)
+            if self.blueprint.decoder.up[i].attn:
+                h = self.execute_layer(f'decoder.up.{i}.attn.0', h)
+            if i != 0:
+                h = self.execute_layer(f'decoder.up.{i}.upsample', h)
+
+        h = self.execute_layer('decoder.norm_out', h)
+        dec = self.execute_layer('decoder.conv_out', h)
+        return dec
 
 class T5Scheduler(BaseScheduler):
     """
     Scheduler for the T5 text encoder.
     """
     def run_encoder_inference(self, input_ids):
-        plan = ['shared'] + [f'block.{i}' for i in range(len(self.blueprint.block))] + ['final_layer_norm']
+        # The transformer blocks and final norm are inside the 'encoder' attribute
+        plan = ['shared'] + [f'encoder.block.{i}' for i in range(len(self.blueprint.encoder.block))] + ['encoder.final_layer_norm']
         self._prepare_execution_plan(plan)
 
         hidden_states = self.execute_layer('shared', input_ids)
-        for i in range(len(self.blueprint.block)):
-            hidden_states = self.execute_layer(f'block.{i}', hidden_states)[0]
-        hidden_states = self.execute_layer('final_layer_norm', hidden_states)
+        for i in range(len(self.blueprint.encoder.block)):
+            hidden_states = self.execute_layer(f'encoder.block.{i}', hidden_states)[0]
+        hidden_states = self.execute_layer('encoder.final_layer_norm', hidden_states)
         return hidden_states
 
 class CLIPScheduler(BaseScheduler):

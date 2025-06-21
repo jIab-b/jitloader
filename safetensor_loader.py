@@ -120,6 +120,6 @@ class SafetensorLoader:
             tensor = torch.from_numpy(np_array)
         
         if self.quant_config == "nf4":
-            return self.F.quantize_4bit(tensor, blocksize=64, compute_dtype=torch.bfloat16)[0].to(device)
+            return self.F.quantize_4bit(tensor, blocksize=64)[0].to(device)
         
         return tensor.to(device)

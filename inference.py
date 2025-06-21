@@ -12,29 +12,45 @@ import torch
 import numpy as np
 from PIL import Image
 from transformers import T5Tokenizer, CLIPTokenizer
+from concurrent.futures import ThreadPoolExecutor
 
 from .model_loader import load_pipeline
 
-def run_inference(prompt: str, output_path: str = "jitloader/output.png"):
+def run_inference(prompt: str, output_path: str = "jitloader/output.png", quant_config: str = "nf4"):
     """
-    Runs the full JIT inference pipeline.
+    Runs the full JIT inference pipeline with parallel text encoders.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
     # 1. Load all model schedulers
-    schedulers = load_pipeline(device)
+    schedulers = load_pipeline(device, quant_config=quant_config)
+    t5_scheduler = schedulers["t5"]
+    clip_scheduler = schedulers["clip"]
     flux_scheduler = schedulers["flux"]
     vae_scheduler = schedulers["vae"]
-    # TODO: Implement CLIP and T5 scheduler execution for text encoding.
 
-    # 2. Prepare inputs
-    # TODO: Replace with actual tokenizer logic
-    # For now, create dummy context tensors.
-    # This is a placeholder for the concatenated output of T5 and CLIP.
-    context = torch.randn(1, 1024, 4096, device=device) 
-    # This is a placeholder for the pooled vector embeddings.
-    y = torch.randn(1, 2048, device=device)
+    # 2. Tokenize prompt
+    t5_tokenizer = T5Tokenizer.from_pretrained("jitloader/t5_tokenizer")
+    clip_tokenizer = CLIPTokenizer.from_pretrained("jitloader/clip_tokenizer")
+    
+    t5_tokens = t5_tokenizer(prompt, return_tensors="pt", padding=True).input_ids.to(device)
+    clip_tokens = clip_tokenizer(prompt, return_tensors="pt", padding=True).input_ids.to(device)
+
+    # 3. Run Text Encoders in Parallel
+    print("Running text encoders in parallel...")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        t5_future = executor.submit(t5_scheduler.run_encoder_inference, t5_tokens)
+        clip_future = executor.submit(clip_scheduler.run_encoder_inference, clip_tokens)
+        
+        t5_embeddings = t5_future.result()
+        clip_embeddings = clip_future.result()
+    print("Text encoders finished.")
+
+    # 4. Prepare inputs for FLUX
+    context = torch.cat([t5_embeddings, clip_embeddings], dim=1)
+    # Create a dummy pooled vector for now
+    y = torch.randn(1, t5_scheduler.blueprint.config.d_model + clip_scheduler.blueprint.config.hidden_size, device=device)
 
     # Latent noise
     height, width = 1024, 1024
@@ -43,40 +59,25 @@ def run_inference(prompt: str, output_path: str = "jitloader/output.png"):
     latent_width = width // patch_size
     latent_channels = flux_scheduler.blueprint.in_channels
     latents = torch.randn(1, latent_channels, latent_height, latent_width, device=device)
+    timestep = torch.tensor([999], device=device)
 
-    # Timestep
-    timestep = torch.tensor([1000], device=device)
-
-    # 3. Run the FLUX model
+    # 5. Run the FLUX model
     print("Running FLUX model...")
     output_latents = flux_scheduler.run_inference(latents, timestep, context, y)
     print("FLUX model finished.")
 
-    # 4. Decode the latents with the VAE
-    # The VAE expects a different channel dimension.
-    # This is a simplified call; a real implementation would need to match
-    # the expected input shape and call the decoder layers sequentially.
-    # For now, we assume a direct decode method for simplicity.
-    # output_latents needs to be scaled correctly before decoding.
-    # VAE blueprint: AutoencoderKL
-    # We need to call the 'decode' method layer by layer.
-    # This part is complex and is stubbed for now.
-    print("Running VAE decoder (STUBBED)...")
-    # vae_scheduler.decode(output_latents) # This is a placeholder
-    
-    # As a placeholder, create a dummy image from the output latents
-    # This will look like noise, but proves the pipeline ran.
-    # We'll take the first 3 channels to create an RGB image.
-    noisy_image_tensor = output_latents[0, :3, :, :].cpu()
-    noisy_image_tensor = (noisy_image_tensor + 1.0) / 2.0 # Normalize to [0, 1]
-    noisy_image_tensor = noisy_image_tensor.permute(1, 2, 0).numpy()
-    noisy_image_tensor = (noisy_image_tensor * 255).astype(np.uint8)
-    image = Image.fromarray(noisy_image_tensor)
-    
-    # 5. Save the output image
-    image.save(output_path)
-    print(f"Inference complete. Noisy output saved to {output_path}")
+    # 6. Decode the latents with the VAE
+    print("Running VAE decoder...")
+    image_tensor = vae_scheduler.run_decoder_inference(output_latents)
+    print("VAE decoder finished.")
 
+    # 7. Save the output image
+    image_tensor = image_tensor.squeeze(0).permute(1, 2, 0)
+    image_tensor = (image_tensor + 1.0) / 2.0
+    image_tensor = (image_tensor.clamp(0, 1) * 255).byte().cpu().numpy()
+    image = Image.fromarray(image_tensor)
+    image.save(output_path)
+    print(f"Inference complete. Output saved to {output_path}")
 
 if __name__ == "__main__":
     sample_prompt = "A photograph of a majestic lion in the savanna."
