@@ -31,11 +31,18 @@ class BaseScheduler:
         submodule = self.blueprint.get_submodule(layer_name)
         for pname, _ in submodule.named_parameters(recurse=False):
             full_name = f"{layer_name}.{pname}"
-            state_dict[pname] = self.loader.load_tensor(full_name, device='cpu')
+            tensor = self.loader.load_tensor(full_name).to(self.device)
+            if self.loader.quant_config:
+                tensor = self.loader.F.quantize_4bit(
+                    tensor,
+                    quant_type=self.loader.quant_config,
+                    blocksize=64
+                )[0]
+            state_dict[pname] = tensor
         for bname, _ in submodule.named_buffers(recurse=False):
             full_name = f"{layer_name}.{bname}"
             try:
-                state_dict[bname] = self.loader.load_tensor(full_name, device='cpu')
+                state_dict[bname] = self.loader.load_tensor(full_name).to(self.device)
             except KeyError:
                 pass
         return state_dict
@@ -57,15 +64,10 @@ class BaseScheduler:
             new_future = self.executor.submit(self._load_layer_state_dict, next_layer_to_prefetch)
             self.prefetch_queue.put((next_layer_to_prefetch, new_future))
 
-        # Get the state dict from the completed future
+        # Get the state dict from the completed future. Tensors are already on the correct device.
         state_dict = future.result()
-        submodule = self.blueprint.get_submodule(layer_name)
+        submodule = self.blueprint.get_submodule(layer_name).to_empty(device=self.device)
         
-        # Move tensors to GPU and execute
-        for key, tensor in state_dict.items():
-            state_dict[key] = tensor.to(self.device)
-        
-        submodule = submodule.to(self.device)
         submodule.load_state_dict(state_dict, strict=False)
 
         with torch.no_grad():

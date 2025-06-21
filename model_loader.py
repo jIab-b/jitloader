@@ -44,13 +44,43 @@ def _load_flux_model_config():
         "theta": 10000, "guidance_embed": True,
     }
 
+def _load_t5_config(path: str):
+    """
+    Correctly loads a model's config.json file.
+    """
+    with open(path, 'r') as f:
+        return json.load(f)
 
-def _load_model_config(path: str):
+def _load_clip_config(path: str):
     """
-    Loads model configuration from a safetensor file's metadata.
+    Infers the CLIPTextConfig parameters by inspecting tensor shapes
+    in the safetensor header.
     """
-    metadata = extract_safetensor_metadata(path)
-    return metadata.get("__metadata__", {})
+    header = extract_safetensor_metadata(path)
+    
+    # From text_model.embeddings.token_embedding.weight
+    embedding_info = header['text_model.embeddings.token_embedding.weight']
+    vocab_size, hidden_size = embedding_info['shape']
+
+    # From text_model.encoder.layers.0.mlp.fc1.weight
+    mlp_info = header['text_model.encoder.layers.0.mlp.fc1.weight']
+    intermediate_size = mlp_info['shape'][0]
+
+    # Find the highest layer index to determine the number of layers
+    layer_keys = [k for k in header if k.startswith('text_model.encoder.layers.')]
+    layer_indices = {int(k.split('.')[3]) for k in layer_keys}
+    num_hidden_layers = max(layer_indices) + 1 if layer_indices else 0
+
+    # We assume some standard values like num_attention_heads if they can't be inferred
+    return {
+        "vocab_size": vocab_size,
+        "hidden_size": hidden_size,
+        "intermediate_size": intermediate_size,
+        "num_hidden_layers": num_hidden_layers,
+        "num_attention_heads": 12, # Standard for CLIP-L
+        "projection_dim": 768    # Standard for CLIPTextModel
+    }
+
 
 
 def _load_t5_weight_map(path: str):
@@ -75,10 +105,12 @@ def load_pipeline(device: str = "cuda", quant_config: str = None):
 
     # --- Create Model Blueprints on 'meta' device ---
     # This avoids allocating memory. The scheduler will stream weights later.
-    clip_config = CLIPTextConfig(**_load_model_config(clip_path))
+    clip_config = CLIPTextConfig(**_load_clip_config(clip_path))
+
     clip_blueprint = CLIPTextModel(clip_config).to("meta")
 
-    t5_config = T5Config(**_load_model_config(t5_path))
+    t5_config_dict = _load_t5_config(t5_path)
+    t5_config = T5Config.from_dict(t5_config_dict)
     t5_blueprint = T5EncoderModel(t5_config).to("meta")
 
     vae_config = _load_vae_model_config()

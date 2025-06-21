@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .model_loader import load_pipeline
 
-def run_inference(prompt: str, output_path: str = "jitloader/output.png", quant_config: str = "nf4"):
+def run_inference(prompt: str, output_path: str = "jitloader/output.png", quant_config: str = None):
     """
     Runs the full JIT inference pipeline with parallel text encoders.
     """

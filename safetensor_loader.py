@@ -77,9 +77,10 @@ class SafetensorLoader:
         for file_handle in self.file_handles.values():
             file_handle.close()
 
-    def load_tensor(self, name: str, device: str = "cpu") -> torch.Tensor:
+    def load_tensor(self, name: str) -> torch.Tensor:
         """
-        Materialise a tensor from disk.
+        Materialise a tensor from disk to a raw CPU tensor.
+        Device placement and quantization are handled by the scheduler.
         """
         if self.weight_map:
             if name not in self.weight_map:
@@ -119,7 +120,4 @@ class SafetensorLoader:
             np_array = np.frombuffer(data, dtype=numpy_dtype).reshape(shape)
             tensor = torch.from_numpy(np_array)
         
-        if self.quant_config == "nf4":
-            return self.F.quantize_4bit(tensor, blocksize=64)[0].to(device)
-        
-        return tensor.to(device)
+        return tensor
