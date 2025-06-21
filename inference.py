@@ -12,13 +12,12 @@ import torch
 import numpy as np
 from PIL import Image
 from transformers import T5Tokenizer, CLIPTokenizer
-from concurrent.futures import ThreadPoolExecutor
 
 from .model_loader import load_pipeline
 
 def run_inference(prompt: str, output_path: str = "jitloader/output.png", quant_config: str = None):
     """
-    Runs the full JIT inference pipeline with parallel text encoders.
+    Runs the full JIT inference pipeline with sequential text encoders.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
@@ -37,15 +36,14 @@ def run_inference(prompt: str, output_path: str = "jitloader/output.png", quant_
     t5_tokens = t5_tokenizer(prompt, return_tensors="pt", padding=True).input_ids.to(device)
     clip_tokens = clip_tokenizer(prompt, return_tensors="pt", padding=True).input_ids.to(device)
 
-    # 3. Run Text Encoders in Parallel
-    print("Running text encoders in parallel...")
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        t5_future = executor.submit(t5_scheduler.run_encoder_inference, t5_tokens)
-        clip_future = executor.submit(clip_scheduler.run_encoder_inference, clip_tokens)
-        
-        t5_embeddings = t5_future.result()
-        clip_embeddings = clip_future.result()
-    print("Text encoders finished.")
+    # 3. Run Text Encoders in sequence
+    print("Running T5 encoder...")
+    t5_embeddings = t5_scheduler.run_encoder_inference(t5_tokens)
+    print("T5 encoder finished.")
+
+    print("Running CLIP encoder...")
+    clip_embeddings = clip_scheduler.run_encoder_inference(clip_tokens)
+    print("CLIP encoder finished.")
 
     # 4. Prepare inputs for FLUX
     context = torch.cat([t5_embeddings, clip_embeddings], dim=1)
