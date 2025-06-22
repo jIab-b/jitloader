@@ -205,34 +205,56 @@ class T5Scheduler(BaseScheduler):
     """
     def run_encoder_inference(self, input_ids):
         plan = ['shared'] + [f'encoder.block.{i}' for i in range(len(self.blueprint.encoder.block))] + ['encoder.final_layer_norm']
-        
-        self.execution_plan = plan
-        
-        # Prefetch first two layers
-        #self.executor.submit(self._load_layer_to_pool, plan[0])
-        #self.executor.submit(self._load_layer_to_pool, plan[1])
-
         self._prepare_execution_plan(plan)
-
-        print('finished first two layer execute')
 
         streams = [self.stream_a, self.stream_b]
         hidden_states = input_ids
+        position_bias = None
+
+        # --- Pre-computation of Position Bias ---
+        # 1. Get the first block to compute the bias, as the parent T5Model would.
+        first_block_name = 'encoder.block.0'
+        first_block_cpu_handles = self._load_layer_to_pool(first_block_name)
+        
+        # 2. Temporarily load it to the GPU on the default stream
+        self.allocator.reset('gpu', buffer_id=0)
+        with torch.cuda.stream(self.stream_a):
+            state_dict = {}
+            for name, cpu_tensor in first_block_cpu_handles.items():
+                gpu_tensor = self.allocator.allocate(cpu_tensor.nbytes, 'cuda', buffer_id=0).view(cpu_tensor.dtype).reshape(cpu_tensor.shape)
+                gpu_tensor.copy_(cpu_tensor, non_blocking=True)
+                state_dict[name] = gpu_tensor
+            
+            first_block_module = self.blueprint.get_submodule(first_block_name).to_empty(device=self.device)
+            first_block_module.load_state_dict(state_dict, strict=False)
+
+            # 3. Compute the bias and keep it on the GPU
+            attention_layer = first_block_module.layer[0].SelfAttention
+            attention_mask = torch.ones(hidden_states.shape[:2], device=self.device)
+            extended_attention_mask = attention_mask[:, None, None, :]
+            model_dtype = first_block_module.layer[0].SelfAttention.q.weight.dtype
+            extended_attention_mask = extended_attention_mask.to(dtype=model_dtype)
+            extended_attention_mask = (1.0 - extended_attention_mask) * torch.finfo(model_dtype).min
+            
+            position_bias = attention_layer.compute_bias(hidden_states.shape[1], hidden_states.shape[1])
+
+        # The first block's weights are now free, but the bias tensor remains.
+        # The prefetch queue already contains the data for the first *two* layers.
+        # We need to consume the one we just used for the bias calculation.
+        self.prefetch_queue.get()
 
         for i, layer_name in enumerate(plan):
             buffer_id = i % 2
             stream = streams[buffer_id]
             
-            # Wait for the previous computation on this stream to finish before reusing buffer
             stream.synchronize()
             self.allocator.reset('gpu', buffer_id=buffer_id)
             
-            # Get CPU tensors for the current layer
             cpu_handles = self.prefetch_queue.get().result()
 
-            # Submit prefetch for the next layer
-            if i + 2 < len(plan):
-                self.executor.submit(self._load_layer_to_pool, plan[i + 2])
+            if i + self.prefetch_depth < len(plan):
+                future = self.executor.submit(self._load_layer_to_pool, plan[i + self.prefetch_depth])
+                self.prefetch_queue.put(future)
 
             with torch.cuda.stream(stream):
                 state_dict = {}
@@ -247,31 +269,16 @@ class T5Scheduler(BaseScheduler):
                 if layer_name == 'shared':
                     hidden_states = submodule(hidden_states)
                 elif 'block' in layer_name:
-                    seq_length = hidden_states.shape[1]
-                    attention_mask = torch.ones(hidden_states.shape[:2], device=hidden_states.device)
-                    
-                    extended_attention_mask = attention_mask[:, None, None, :]
-                    #extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
-                    extended_attention_mask = extended_attention_mask.to(dtype=hidden_states.dtype)  # Match the dtype
-                    extended_attention_mask = (1.0 - extended_attention_mask) * torch.finfo(hidden_states.dtype).min
-        
-                    cache_position = torch.arange(seq_length, device=hidden_states.device)
                     hidden_states = submodule(
                         hidden_states,
-                        attention_mask=attention_mask,
-                        position_bias=None,
-                        #cache_position=cache_position,
+                        attention_mask=extended_attention_mask,
+                        position_bias=position_bias,
                         use_cache=False
                     )[0]
-
-                    #attention_mask = torch.ones(hidden_states.shape[:2], device=hidden_states.device)
-                    #hidden_states = submodule(hidden_states,attention_mask=attention_mask, use_cache=False)[0]
-                else:
+                else: # final_layer_norm
                     hidden_states = submodule(hidden_states)
 
-        # Final synchronization before returning
         torch.cuda.synchronize()
-        print(hidden_states.size())
         return hidden_states
 
 class CLIPScheduler(BaseScheduler):
