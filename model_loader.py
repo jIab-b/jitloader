@@ -114,6 +114,7 @@ def load_pipeline(device: str = "cuda", quant_config: str = None, cpu_pool_size:
     t5_config = T5Config.from_dict(t5_config_dict)
     t5_config.use_cache = False
     t5_blueprint = T5EncoderModel(t5_config).to("meta")
+    print(t5_blueprint)
 
     vae_config = _load_vae_model_config()
     vae_blueprint = AutoencoderKL(**vae_config).to("meta")

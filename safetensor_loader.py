@@ -117,12 +117,12 @@ class SafetensorLoader:
         if info['dtype'] == 'BF16':
             # NumPy doesn't have a bfloat16, so we read as uint16 and view as bfloat16 in torch
             np_buffer = np.frombuffer(data, dtype=np.uint16).reshape(shape)
-            tensor_view = torch.from_numpy(np_buffer).view(torch.bfloat16)
+            tensor_view = torch.from_numpy(np_buffer.copy()).view(torch.bfloat16)
         else:
             # Create a numpy array view of the buffer without copying
             np_buffer = np.frombuffer(data, dtype=NUMPY_DTYPE_MAP[info['dtype']]).reshape(shape)
             # Create a torch tensor from the numpy array without copying
-            tensor_view = torch.from_numpy(np_buffer)
+            tensor_view = torch.from_numpy(np_buffer.copy())
 
         # Copy the data into the provided buffer
         buffer.copy_(tensor_view)
